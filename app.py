@@ -20,6 +20,7 @@ import urllib.request
 import zipfile
 import signal
 from datetime import datetime
+from contextlib import asynccontextmanager
 import io
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse, FileResponse
 from starlette.background import BackgroundTask
@@ -32,6 +33,20 @@ from typing import Optional, List, Dict
 import uvicorn
 import httpx
 
+# Centralized config. Importing this triggers load_dotenv() and fail-fast
+# validation of SECRET_KEY / MASTER_KEY — must run before SessionMiddleware.
+import config
+
+# Rate limiter (module-level so route decorators can reference it).
+from slowapi import Limiter, _rate_limit_exceeded_handler
+
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from middleware import CsrfCookieMiddleware, SecurityHeadersMiddleware
+
+limiter = Limiter(key_func=config._rate_limit_key, default_limits=[])
+
 try:
     from multicolorcaptcha import CaptchaGenerator
 except ImportError:
@@ -42,6 +57,7 @@ from managers.awg_manager import AWGManager
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
 from managers.backup_manager import BackupManager
+from managers.secrets import encrypt_secret, decrypt_secret, SecretError
 import telegram_bot as tg_bot
 
 # Configure logging
@@ -85,7 +101,27 @@ async def custom_redoc():
         redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
         with_google_fonts=False,
     )
-app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=config.SECRET_KEY,
+    https_only=config.SESSION_COOKIE_SECURE,
+    same_site=config.SESSION_COOKIE_SAMESITE,
+)
+
+# Middleware are added innermost-first; the last add_middleware is outermost.
+# Outer → inner order: TrustedHost → SecurityHeaders → SlowAPI → CSRF → Session.
+app.add_middleware(CsrfCookieMiddleware)
+app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
+
+# RateLimitExceeded → JSON 429 handler.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# TrustedHost: reject foreign Host headers. Skipped in dev so LAN/IP access
+# during local testing is not blocked.
+if not config.AWP_DEV and config.TRUSTED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=config.TRUSTED_HOSTS)
 
 # Mount static files & templates
 app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
@@ -197,8 +233,13 @@ def get_ssh(server):
         host=server['host'],
         port=server.get('ssh_port', 22),
         username=server['username'],
-        password=server.get('password'),
-        private_key=server.get('private_key'),
+        password=decrypt_secret(server.get('password')),
+        private_key=decrypt_secret(server.get('private_key')),
+        host_fingerprint=server.get('host_fingerprint'),
+        # Mutate the server dict in-place when a fingerprint is first observed
+        # (or after a legit reset). It is persisted by the caller's save_data();
+        # read-only endpoints that don't save simply re-pin on the next write.
+        on_fingerprint=lambda fp: server.__setitem__('host_fingerprint', fp),
     )
 
 
@@ -1639,8 +1680,7 @@ class TunnelStartRequest(BaseModel):
 
 # ======================== Startup ========================
 
-@app.on_event("startup")
-async def startup():
+async def _startup():
     data = load_data()
     changed = False
     if not data.get('users'):
@@ -1710,8 +1750,11 @@ async def startup():
     if changed:
         save_data(data)
 
-    # Start periodic background tasks
-    asyncio.create_task(periodic_background_tasks())
+    # Start periodic background tasks — references kept so the lifespan
+    # shutdown phase can cancel them cleanly (B39).
+    global _bg_traffic, _bg_backup
+    _bg_traffic = asyncio.create_task(periodic_background_tasks())
+    _bg_backup = asyncio.create_task(_background_backup())
 
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
@@ -1745,6 +1788,40 @@ def _scrape_server_traffic(server, sid, my_conns):
     except Exception as e:
         logger.error(f"Traffic sync err server {sid}: {e}")
     return server_updates
+
+
+async def _background_backup():
+    """Periodically copy data.json to a timestamped backup, pruning old copies.
+
+    BACKUP_INTERVAL_HOURS=0 disables the loop. All backups inherit the Fernet
+    encryption applied to SSH secrets — nothing plaintext is ever written.
+    """
+    while True:
+        interval = config.BACKUP_INTERVAL_HOURS * 3600
+        if interval <= 0:
+            await asyncio.sleep(3600)
+            continue
+        await asyncio.sleep(interval)
+        try:
+            backup_dir = os.environ.get('BACKUP_DIR', os.path.join(os.path.dirname(DATA_FILE), 'backups'))
+            os.makedirs(backup_dir, exist_ok=True)
+            stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+            dest = os.path.join(backup_dir, f'data-{stamp}.json')
+            shutil.copy2(DATA_FILE, dest)
+            logger.info(f'Auto-backup saved to {dest}')
+
+            # Prune oldest files when count exceeds BACKUP_KEEP_COUNT.
+            keep = config.BACKUP_KEEP_COUNT
+            entries = sorted(
+                f for f in os.listdir(backup_dir)
+                if f.startswith('data-') and f.endswith('.json')
+            )
+            while len(entries) > keep:
+                removed = entries.pop(0)
+                os.remove(os.path.join(backup_dir, removed))
+                logger.debug(f'Pruned old backup: {removed}')
+        except Exception as e:
+            logger.error(f'Auto-backup failed: {e}')
 
 
 async def periodic_background_tasks():
@@ -1940,6 +2017,7 @@ async def my_connections_page(request: Request):
 # ======================== AUTH API ========================
 
 @app.get('/api/auth/captcha', tags=["Authentication"])
+@limiter.limit(config.CAPTCHA_RATE_LIMIT)
 async def api_captcha(request: Request):
     if not CaptchaGenerator:
         return JSONResponse({"error": "multicolorcaptcha is not installed"}, status_code=500)
@@ -1957,6 +2035,7 @@ async def api_captcha(request: Request):
 
 
 @app.post('/api/auth/login', tags=["Authentication"])
+@limiter.limit(config.LOGIN_RATE_LIMIT)
 async def api_login(request: Request, req: LoginRequest):
     data = load_data()
     captcha_settings = data.get('settings', {}).get('captcha', {})
@@ -2027,14 +2106,16 @@ async def api_add_server(request: Request, req: AddServerRequest):
         try:
             ssh.connect()
             server_info = ssh.test_connection()
+            host_fingerprint = ssh.host_fingerprint
             ssh.disconnect()
         except Exception as e:
             return JSONResponse({'error': f'Connection failed: {str(e)}'}, status_code=400)
 
         server = {
             'name': name, 'host': host, 'ssh_port': req.ssh_port,
-            'username': username, 'password': req.password,
-            'private_key': req.private_key, 'server_info': server_info,
+            'username': username, 'password': encrypt_secret(req.password),
+            'private_key': encrypt_secret(req.private_key), 'server_info': server_info,
+            'host_fingerprint': host_fingerprint,
             'protocols': {},
         }
         data = load_data()
@@ -2066,22 +2147,28 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
 
         # Credential resolution: a non-empty value in either field switches to
         # that auth method (and clears the other). Both omitted => keep current.
+        # We resolve PLAINTEXT for the connection attempt and store ENCRYPTED.
         if req.private_key:
-            new_pass, new_key = '', req.private_key
+            plain_pass, plain_key = '', req.private_key
         elif req.password:
-            new_pass, new_key = req.password, ''
+            plain_pass, plain_key = req.password, ''
         else:
-            new_pass = server.get('password', '')
-            new_key = server.get('private_key', '')
+            plain_pass = decrypt_secret(server.get('password', ''))
+            plain_key = decrypt_secret(server.get('private_key', ''))
 
-        if not new_pass and not new_key:
+        if not plain_pass and not plain_key:
             return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
 
         # Verify the new connection details before committing the change.
-        ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+        # Only enforce the pinned fingerprint when the host is unchanged; a new
+        # host is treated as a first connect (accept + re-pin).
+        expected_fp = server.get('host_fingerprint') if new_host == server.get('host') else None
+        ssh = SSHManager(new_host, new_port, new_user, plain_pass, plain_key,
+                         host_fingerprint=expected_fp)
         try:
             ssh.connect()
             server_info = ssh.test_connection()
+            host_fingerprint = ssh.host_fingerprint
             ssh.disconnect()
         except Exception as e:
             return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
@@ -2090,8 +2177,9 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
         server['host'] = new_host
         server['ssh_port'] = new_port
         server['username'] = new_user
-        server['password'] = new_pass
-        server['private_key'] = new_key
+        server['password'] = encrypt_secret(plain_pass)
+        server['private_key'] = encrypt_secret(plain_key)
+        server['host_fingerprint'] = host_fingerprint
         server['server_info'] = server_info
         save_data(data)
         return {'status': 'success', 'server_info': server_info}
@@ -2132,6 +2220,24 @@ async def api_server_ping(request: Request, server_id: int):
         return {'alive': False, 'error': 'timeout', 'ms': None}
     except Exception as e:
         return {'alive': False, 'error': str(e), 'ms': None}
+
+
+@app.post('/api/servers/{server_id}/reset-fingerprint', tags=["Servers"])
+async def api_reset_server_fingerprint(request: Request, server_id: int):
+    """Clear the pinned SSH host-key fingerprint for a server.
+
+    Use after a legitimate server reinstall / IP change that rotates the host
+    key. The next successful connection re-pins the new key automatically.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    server['host_fingerprint'] = None
+    save_data(data)
+    return {'status': 'success'}
 
 
 @app.post('/api/servers/reorder', tags=["Servers"])
@@ -3483,6 +3589,7 @@ async def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Re
 
 
 @app.get('/share/{token}', response_class=HTMLResponse, tags=["System Templates"])
+@limiter.limit(config.SHARE_RATE_LIMIT)
 async def share_page(token: str, request: Request):
     data = load_data()
     user = next((u for u in data['users'] if u.get('share_token') == token), None)
@@ -3500,6 +3607,7 @@ async def share_page(token: str, request: Request):
 
 
 @app.post('/api/share/{token}/auth', tags=["Sharing"])
+@limiter.limit(config.SHARE_RATE_LIMIT)
 async def api_share_auth(token: str, req: ShareAuthRequest, request: Request):
     data = load_data()
     user = next((u for u in data['users'] if u.get('share_token') == token), None)
@@ -3515,6 +3623,7 @@ async def api_share_auth(token: str, req: ShareAuthRequest, request: Request):
 
 
 @app.get('/api/share/{token}/connections', tags=["Sharing"])
+@limiter.limit(config.SHARE_RATE_LIMIT)
 async def api_share_connections(token: str, request: Request):
     data = load_data()
     user = next((u for u in data['users'] if u.get('share_token') == token), None)
@@ -3537,6 +3646,7 @@ async def api_share_connections(token: str, request: Request):
 
 
 @app.post('/api/share/{token}/config/{connection_id}', tags=["Sharing"])
+@limiter.limit(config.SHARE_RATE_LIMIT)
 async def api_share_config(token: str, connection_id: str, request: Request):
     data = load_data()
     user = next((u for u in data['users'] if u.get('share_token') == token), None)
@@ -3956,6 +4066,40 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
     except Exception as e:
         logger.exception("Error during restore")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@asynccontextmanager
+async def _app_lifespan(app):
+    """Modern ASGI lifespan — replaces the deprecated @app.on_event('startup')."""
+    # ── startup ──
+    await _startup()
+
+    # ── running ──
+    yield
+
+    # ── graceful shutdown ──
+    logger.info("Shutting down gracefully...")
+    # Cancel background tasks so they don't keep the event loop alive.
+    for task_ref in ["_bg_traffic", "_bg_backup"]:
+        t = globals().get(task_ref)
+        if t and not t.done():
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+    for provider in list(TUNNEL_RUNTIMES.keys()):
+        try:
+            await asyncio.to_thread(stop_tunnel, provider)
+        except Exception as e:
+            logger.warning("Error stopping %s tunnel: %s", provider, e)
+    try:
+        await tg_bot.stop_bot()
+    except Exception as e:
+        logger.warning("Error stopping Telegram bot: %s", e)
+
+
+app.router.lifespan_context = _app_lifespan
 
 
 if __name__ == '__main__':

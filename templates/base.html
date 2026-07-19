@@ -212,6 +212,45 @@
             }
         });
 
+        /* ===== CSRF: attach X-CSRF-Token to unsafe requests =====
+           The server sets a non-HttpOnly csrf_token cookie; we read it and echo
+           it back on every non-GET fetch (double-submit). Wrapping window.fetch
+           means both apiCall() below and any direct fetch() in templates are
+           covered. */
+        (function () {
+            const UNSAFE = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+            function getCsrf() {
+                const m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+                return m ? decodeURIComponent(m[1]) : '';
+            }
+            // Only attach the token to same-origin requests — never leak it to
+            // third-party APIs (e.g. the GitHub releases check).
+            function isSameOrigin(input) {
+                try {
+                    const url = input instanceof Request ? input.url : String(input || '');
+                    if (!url || url.startsWith('/')) return true;
+                    return new URL(url, location.href).origin === location.origin;
+                } catch { return false; }
+            }
+            const _fetch = window.fetch;
+            window.fetch = function (input, init) {
+                init = init || {};
+                const method = String(init.method || (input && input.method) || 'GET').toUpperCase();
+                if (UNSAFE.has(method) && isSameOrigin(input)) {
+                    const token = getCsrf();
+                    if (token) {
+                        init.headers = init.headers || {};
+                        if (init.headers instanceof Headers) {
+                            if (!init.headers.has('X-CSRF-Token')) init.headers.set('X-CSRF-Token', token);
+                        } else {
+                            init.headers['X-CSRF-Token'] = init.headers['X-CSRF-Token'] || token;
+                        }
+                    }
+                }
+                return _fetch.call(this, input, init);
+            };
+        })();
+
         /* ===== API Helper ===== */
         async function apiCall(url, method = 'GET', body = null) {
             const opts = {

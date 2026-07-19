@@ -30,8 +30,20 @@ coverage.xml
 
 # User data
 data.json
+data.json.bak*
+backups/
+tunnels_state.json
 .DS_Store
 
-# IDEs
+# Secrets / local env
+.env
+.env.local
+*.local
+
+# Generated OpenAPI dump (regenerated at runtime)
+openapi.json
+
+# Editor / IDEs
 .vscode/
 .idea/
+.kilo/

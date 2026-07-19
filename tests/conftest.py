@@ -15,7 +15,12 @@ os.environ.setdefault("AWP_DEV", "1")
 
 @pytest.fixture
 def data_file(tmp_path):
-    """Point DATA_FILE at an empty, isolated data.json for each test."""
+    """Create an isolated data.json for each test and yield its path.
+
+    ``app_client`` patches ``app.DATA_FILE`` to point at this path directly
+    (app.py binds DATA_FILE once at import time from the env var, so the
+    module global — not the env var — is what each request actually reads).
+    """
     path = tmp_path / "data.json"
     data = {
         "servers": [],
@@ -25,13 +30,7 @@ def data_file(tmp_path):
         "settings": {},
     }
     path.write_text(json.dumps(data), encoding="utf-8")
-    old = os.environ.get("DATA_FILE")
-    os.environ["DATA_FILE"] = str(path)
     yield str(path)
-    if old is not None:
-        os.environ["DATA_FILE"] = old
-    else:
-        os.environ.pop("DATA_FILE", None)
 
 
 @pytest.fixture
@@ -40,6 +39,11 @@ def app_client(data_file):
     from fastapi.testclient import TestClient
 
     import app as _app  # noqa: F811  — triggers lifespan (startup)
+
+    # app.py binds DATA_FILE once at import time (from the env var). Since the
+    # module is cached for the whole session, point the module global at each
+    # test's isolated data file so tests don't share state.
+    _app.DATA_FILE = data_file
 
     with TestClient(_app.app, raise_server_exceptions=False) as c:
         yield c

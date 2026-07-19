@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -28,8 +28,12 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
-      - name: Run tests
+      - name: Run tests with coverage
         run: |
-          pytest --tb=short -v
+          # Coverage floor is the achievable baseline after closing the MVP
+          # test gaps. 40% is blocked by the SSH/Docker-bound managers
+          # (adguard, dns, nginx, socks5, telemt — 0%, need integration test
+          # infra) and will be raised iteratively as that infra lands.
+          pytest --cov=app --cov=managers --cov=middleware --cov=config --cov-fail-under=20 --cov-report=term-missing --tb=short -v
         env:
           AWP_DEV: "1"

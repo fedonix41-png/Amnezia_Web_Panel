@@ -132,7 +132,11 @@ if getattr(sys, 'frozen', False):
 else:
     application_path = os.path.dirname(__file__)
 
-DATA_FILE = os.path.join(application_path, 'data.json')
+DATA_FILE = os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
+# Path used before DATA_FILE honored its env var. Kept for the one-time
+# upgrade rescue in _maybe_migrate_legacy_data_file() — operators who got
+# persistence working under read_only rootfs left their data here.
+_LEGACY_DATA_FILE = os.path.join(application_path, 'data.json')
 CURRENT_VERSION = "v1.5.0"
 BIN_DIR = os.environ.get('TUNNEL_BIN_DIR', os.path.join(application_path, 'bin'))
 TUNNEL_STATE_FILE = os.environ.get('TUNNEL_STATE_FILE', os.path.join(application_path, 'tunnels_state.json'))
@@ -1680,7 +1684,46 @@ class TunnelStartRequest(BaseModel):
 
 # ======================== Startup ========================
 
+def _maybe_migrate_legacy_data_file():
+    """One-time rescue of data.json from the legacy application-directory path.
+
+    Before DATA_FILE honored its env var, the panel wrote to
+    ``<application_path>/data.json``. Operators who got persistence working
+    under ``read_only: true`` rootfs did so by leaving data at that legacy
+    path. Now that DATA_FILE resolves to the volume-backed path (e.g.
+    ``/app/data/data.json`` in compose), this copies the legacy file to the
+    new location ONCE on first boot, so an upgrade does not silently reset
+    the panel to defaults (and lose every encrypted SSH secret).
+
+    Safe no-op for fresh installs (legacy file absent) and for tests (the
+    target path is created by the fixture before this runs). Never overwrites
+    an existing target.
+    """
+    if DATA_FILE == _LEGACY_DATA_FILE:
+        return  # env not overridden — same path, nothing to migrate.
+    if os.path.exists(DATA_FILE):
+        return  # target already present — never overwrite live data.
+    if not os.path.exists(_LEGACY_DATA_FILE):
+        return  # nothing to rescue (fresh install).
+    try:
+        if os.path.getsize(_LEGACY_DATA_FILE) == 0:
+            return
+        os.makedirs(os.path.dirname(DATA_FILE) or '.', exist_ok=True)
+        shutil.copy2(_LEGACY_DATA_FILE, DATA_FILE)
+        logger.warning(
+            "Migrated existing data.json from legacy path %s to %s. "
+            "Back up the legacy file and remove it to avoid confusion.",
+            _LEGACY_DATA_FILE, DATA_FILE,
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to migrate legacy data.json (%s -> %s): %s",
+            _LEGACY_DATA_FILE, DATA_FILE, e,
+        )
+
+
 async def _startup():
+    _maybe_migrate_legacy_data_file()
     data = load_data()
     changed = False
     if not data.get('users'):

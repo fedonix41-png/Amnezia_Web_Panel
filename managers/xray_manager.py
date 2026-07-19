@@ -9,6 +9,73 @@ import urllib.parse
 
 logger = logging.getLogger(__name__)
 
+
+def build_initial_server_json(*, port, site_name, private_key, short_id):
+    """Build the initial Xray server.json structure with Stats + Reality inbound.
+
+    Pure function — no SSH, no I/O. Extracted from install_protocol so the
+    generated structure can be unit-tested without a live server. The ``port``
+    is coerced to int to match the historical inline behaviour. Only the
+    Reality ``privateKey`` and ``shortIds`` are embedded here — the public key
+    is written to its own key file by install_protocol, not to server.json.
+    """
+    return {
+        "log": {"loglevel": "error"},
+        "stats": {},
+        "api": {
+            "services": ["StatsService", "LoggerService", "HandlerService"],
+            "tag": "api"
+        },
+        "policy": {
+            "levels": {
+                "0": {"statsUserUplink": True, "statsUserDownlink": True}
+            },
+            "system": {
+                "statsInboundUplink": True, "statsInboundDownlink": True,
+                "statsOutboundUplink": True, "statsOutboundDownlink": True
+            }
+        },
+        "inbounds": [
+            {
+                "port": int(port),
+                "protocol": "vless",
+                "tag": "proxy",
+                "settings": {
+                    "clients": [],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "tcp",
+                    "security": "reality",
+                    "realitySettings": {
+                        "dest": f"{site_name}:443",
+                        "serverNames": [site_name],
+                        "privateKey": private_key,
+                        "shortIds": [short_id]
+                    }
+                }
+            },
+            {
+                "listen": "127.0.0.1",
+                "port": 10085,
+                "protocol": "dokodemo-door",
+                "settings": {"address": "127.0.0.1"},
+                "tag": "api"
+            }
+        ],
+        "outbounds": [{"protocol": "freedom"}],
+        "routing": {
+            "rules": [
+                {
+                    "inboundTag": ["api"],
+                    "outboundTag": "api",
+                    "type": "field"
+                }
+            ]
+        }
+    }
+
+
 class XrayManager:
     """Manages Xray (VLESS-Reality) protocol installation and client management."""
     
@@ -242,61 +309,12 @@ ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]
         short_id = out_sid.strip()
 
         # Generate initial server.json with Stats and API enabled
-        server_json = {
-            "log": {"loglevel": "error"},
-            "stats": {},
-            "api": {
-                "services": ["StatsService", "LoggerService", "HandlerService"],
-                "tag": "api"
-            },
-            "policy": {
-                "levels": {
-                    "0": {"statsUserUplink": True, "statsUserDownlink": True}
-                },
-                "system": {
-                    "statsInboundUplink": True, "statsInboundDownlink": True,
-                    "statsOutboundUplink": True, "statsOutboundDownlink": True
-                }
-            },
-            "inbounds": [
-                {
-                    "port": int(port),
-                    "protocol": "vless",
-                    "tag": "proxy",
-                    "settings": {
-                        "clients": [],
-                        "decryption": "none"
-                    },
-                    "streamSettings": {
-                        "network": "tcp",
-                        "security": "reality",
-                        "realitySettings": {
-                            "dest": f"{site_name}:443",
-                            "serverNames": [site_name],
-                            "privateKey": priv_key,
-                            "shortIds": [short_id]
-                        }
-                    }
-                },
-                {
-                    "listen": "127.0.0.1",
-                    "port": 10085,
-                    "protocol": "dokodemo-door",
-                    "settings": {"address": "127.0.0.1"},
-                    "tag": "api"
-                }
-            ],
-            "outbounds": [{"protocol": "freedom"}],
-            "routing": {
-                "rules": [
-                    {
-                        "inboundTag": ["api"],
-                        "outboundTag": "api",
-                        "type": "field"
-                    }
-                ]
-            }
-        }
+        server_json = build_initial_server_json(
+            port=port,
+            site_name=site_name,
+            private_key=priv_key,
+            short_id=short_id,
+        )
         
         self.ssh.run_sudo_command(f"mkdir -p {config_dir}")
         self.ssh.upload_file_sudo(json.dumps(server_json, indent=2), f"{config_dir}/server.json")

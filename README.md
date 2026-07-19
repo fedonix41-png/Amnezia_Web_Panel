@@ -177,6 +177,66 @@ Mac
 https://hub.docker.com/r/prvtpro/amnezia-panel
 
 
+## 🚢 Deployment via Docker & Public Tunnel
+
+### Required environment variables
+
+Copy `.env.example` → `.env` and fill these in. `.env.example` is the source of
+truth — this table summarises the production-critical ones.
+
+| Variable | Purpose | Notes |
+| --- | --- | --- |
+| `SECRET_KEY` | Signs session cookies. **Stable across restarts** or every session is invalidated. | ≥32 bytes. `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `MASTER_KEY` | Fernet key encrypting SSH passwords / private keys in `data.json`. | Generate **once**, back up. `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `TRUSTED_HOSTS` | Allowed `Host` header values (comma-separated). Others get `400`. | Include your tunnel domain, e.g. `panel.example.com,localhost,127.0.0.1` |
+| `SESSION_COOKIE_SECURE` | Sets the cookie `Secure` flag. | `true` when serving over HTTPS / a tunnel. |
+| `SESSION_COOKIE_SAMESITE` | Cookie SameSite policy. | `lax` \| `strict` \| `none`. |
+| `LOGIN_RATE_LIMIT` | Login brute-force cap (slowapi). | Default `5/minute`. |
+| `SHARE_RATE_LIMIT` | Share-endpoint cap. | Default `10/minute`. |
+| `BACKUP_INTERVAL_HOURS` | Auto-backup cadence for `data.json`. | `0` disables. |
+| `AWP_DEV` | Dev mode — synthesises ephemeral keys when secrets are missing. | **Local only.** `1` in dev, unset/`0` in prod. |
+
+### Quick start
+
+```bash
+cp .env.example .env
+# fill in SECRET_KEY and MASTER_KEY as above
+docker compose up -d
+```
+
+The panel is then at `http://localhost:${APP_PORT}` (default `5000`).
+
+### Opening the panel via a public tunnel
+
+After the container is up:
+
+1. Log in → `/settings` → start a **Cloudflare Quick Tunnel** (or **ngrok**).
+2. Copy the issued `https://*.trycloudflare.com` (or ngrok) URL.
+3. Add that domain to `TRUSTED_HOSTS` in `.env` and `docker compose restart`.
+   Without this, `TrustedHostMiddleware` rejects the tunnelled request with `400`.
+4. Set `SESSION_COOKIE_SECURE=true` so cookies are only sent over HTTPS.
+5. Repeat login / server / protocol flows over the public URL.
+
+### Security notes
+
+* **Never commit `.env` or `data.json`** — both hold secrets. They are in `.gitignore`.
+* A lost `MASTER_KEY` makes every encrypted SSH secret in `data.json` **permanently unreadable**. Back it up somewhere safe.
+* A changed `SECRET_KEY` **invalidates all sessions** — every user must log in again.
+* Keep both keys stable in production; rotating either has the consequences above.
+
+### Dev mode
+
+`AWP_DEV=1` makes `config.py` synthesise ephemeral `SECRET_KEY` / `MASTER_KEY`
+values so local development works without configuration. **Use only locally** —
+synthesised keys mean sessions die on restart and encrypted secrets from a
+prior run become unreadable. `scripts/migrate_secrets.py` refuses to run with
+`AWP_DEV=1` unless passed `--force`, to prevent accidental migration against
+throwaway keys.
+
+A full manual validation walkthrough (login, protocol install, encryption-at-rest
+check, tunnel, rate-limit, CSRF, backup) lives in [`docs/mvp-smoke-checklist.md`](docs/mvp-smoke-checklist.md).
+
+
 ### Initial Login
 *   **Username**: `admin`
 *   **Password**: `admin`

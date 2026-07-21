@@ -1,8 +1,1 @@
-{
-  "cloudflare": {
-    "pid": 326690,
-    "public_url": "https://gale-cottages-echo-endorsed.trycloudflare.com",
-    "started_at": "2026-07-19T18:11:28.098628",
-    "binary": "/home/ozzy/Документы/Amnezia-Web-Panel/bin/cloudflared"
-  }
-}
+{}

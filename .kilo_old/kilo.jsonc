@@ -1,0 +1,21 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "plugin": ["opencode-kcp-plugin"],
+  "permission": {
+    "read": "allow",
+    "edit": "allow",
+    "bash": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "external_directory": "ask",
+    "task": "allow"
+  },
+  "mcp": {
+    "browsermcp": {
+      "type": "local",
+      "command": ["npx", "@browsermcp/mcp@latest"],
+      "enabled": true
+    }
+  }
+}
